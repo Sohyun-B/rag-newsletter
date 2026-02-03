@@ -1,0 +1,20 @@
+services:
+  backend:
+    build: ./backend
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./backend/gmail/token.json:/app/gmail/token.json:ro
+      - ./chroma_data:/app/chroma_data
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    env_file: .env
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+    restart: unless-stopped
