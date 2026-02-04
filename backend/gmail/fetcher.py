@@ -174,6 +174,68 @@ def fetch_new_newsletters(max_results: int = MAX_RESULTS) -> list[dict]:
         raise
 
 
+def fetch_emails_by_senders(senders: list[str], max_per_sender: int = 500) -> list[dict]:
+    """
+    발신인 기준으로 이메일 가져오기 (과거 이메일 포함)
+
+    Args:
+        senders: 발신인 이메일 주소 리스트
+        max_per_sender: 발신인당 최대 가져올 수
+
+    Returns:
+        삽입된 이메일 정보 리스트
+    """
+    service = get_gmail_service()
+    inserted = []
+
+    for sender in senders:
+        logger.info(f"Fetching emails from: {sender}")
+        try:
+            page_token = None
+            fetched = 0
+
+            while True:
+                results = service.users().messages().list(
+                    userId="me",
+                    q=f"from:{sender}",
+                    maxResults=min(100, max_per_sender - fetched),
+                    pageToken=page_token
+                ).execute()
+
+                messages = results.get("messages", [])
+                if not messages:
+                    break
+
+                for msg_ref in messages:
+                    message = fetch_message_detail(service, msg_ref["id"])
+                    if not message:
+                        continue
+
+                    email_data = process_message(message)
+                    if not email_data:
+                        continue
+
+                    new_id = insert_email(**email_data)
+                    if new_id:
+                        email_data["id"] = new_id
+                        inserted.append(email_data)
+
+                    fetched += 1
+
+                page_token = results.get("nextPageToken")
+                if not page_token or fetched >= max_per_sender:
+                    break
+
+            logger.info(f"  {sender}: fetched {fetched}, inserted {sum(1 for e in inserted if e.get('from_address','').find(sender.split('@')[0]) >= 0)}")
+
+        except Exception as e:
+            logger.error(f"Failed to fetch from {sender}: {e}")
+            continue
+
+    logger.info(f"Total inserted: {len(inserted)}")
+    return inserted
+
+
 def sync_gmail() -> dict[str, Any]:
     """
     Gmail 동기화 실행

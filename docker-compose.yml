@@ -6,7 +6,7 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app
-      - ./backend/gmail/token.json:/app/gmail/token.json:ro
+      - ./backend/gmail/token.json:/app/gmail/token.json
       - ./chroma_data:/app/chroma_data
     restart: unless-stopped
 

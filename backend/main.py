@@ -9,7 +9,7 @@ from pydantic import BaseModel
 from config import settings
 from db import test_connection, get_newsletters, get_newsletter_by_id, get_newsletter_count
 from vectorstore import get_collection_count
-from gmail import sync_gmail, test_gmail_connection
+from gmail import sync_gmail, fetch_emails_by_senders, test_gmail_connection
 from etl import process_unprocessed_emails
 from rag import search_similar_chunks, generate_answer, parse_citations_response
 from scheduler import start_scheduler, stop_scheduler, get_scheduler_status
@@ -133,6 +133,35 @@ async def chat(request: ChatRequest):
 
     except Exception as e:
         logger.error(f"Chat error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class SyncBySendersRequest(BaseModel):
+    senders: list[str]
+    max_per_sender: int = 500
+
+
+@app.post("/sync/senders")
+async def sync_by_senders(request: SyncBySendersRequest):
+    """발신인 기준으로 과거 이메일 수집 + ETL"""
+    logger.info(f"Sync by senders: {request.senders}")
+
+    try:
+        inserted = fetch_emails_by_senders(request.senders, request.max_per_sender)
+
+        etl_result = await process_unprocessed_emails()
+
+        return {
+            "inserted_count": len(inserted),
+            "inserted_emails": [
+                {"id": e["id"], "subject": e["subject"], "from": e["from_address"]}
+                for e in inserted
+            ],
+            "etl_result": etl_result
+        }
+
+    except Exception as e:
+        logger.error(f"Sync by senders error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

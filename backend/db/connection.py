@@ -8,6 +8,17 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 
+def _handle_datetimeoffset(dto_value):
+    """DATETIMEOFFSET 타입 처리"""
+    tup = struct.unpack("<6hI2h", dto_value)
+    return datetime(tup[0], tup[1], tup[2], tup[3], tup[4], tup[5], tup[6] // 1000,
+                    timezone(timedelta(hours=tup[7], minutes=tup[8])))
+
+
+import struct
+from datetime import datetime, timedelta, timezone
+
+
 def get_connection_string() -> str:
     """MSSQL 연결 문자열 생성"""
     return (
@@ -26,6 +37,7 @@ def get_db_connection():
     conn = None
     try:
         conn = pyodbc.connect(get_connection_string())
+        conn.add_output_converter(-155, _handle_datetimeoffset)
         yield conn
     except pyodbc.Error as e:
         logger.error(f"Database connection error: {e}")
