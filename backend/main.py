@@ -11,7 +11,7 @@ from db import test_connection, get_newsletters, get_newsletter_by_id, get_newsl
 from vectorstore import get_collection_count
 from gmail import sync_gmail, fetch_emails_by_senders, test_gmail_connection
 from etl import process_unprocessed_emails
-from rag import search_similar_chunks, generate_answer, parse_citations_response
+from rag import search_similar_chunks, generate_answer, parse_citations_response, analyze_query
 from scheduler import start_scheduler, stop_scheduler, get_scheduler_status
 
 # 로깅 설정
@@ -58,10 +58,21 @@ class ChatRequest(BaseModel):
     query: str
 
 
+class QueryAnalysisInfo(BaseModel):
+    original_query: str
+    rewritten_query: str
+    date_from: str | None
+    date_to: str | None
+    sender_filter: str | None
+    keywords: list[str]
+    chunks_found: int
+
+
 class ChatResponse(BaseModel):
     text: str
     citations: list[dict[str, Any]]
     sources: list[dict[str, Any]]
+    analysis: QueryAnalysisInfo | None = None
 
 
 class SyncResponse(BaseModel):
@@ -102,7 +113,7 @@ async def chat(request: ChatRequest):
     RAG 채팅 엔드포인트
 
     1. 쿼리로 유사 청크 검색
-    2. Claude Citations API로 답변 생성
+    2. OpenAI Chat Completions API로 답변 생성
     3. 파싱된 답변 + 인용 정보 반환
     """
     if not request.query.strip():
@@ -111,14 +122,34 @@ async def chat(request: ChatRequest):
     logger.info(f"Chat request: {request.query[:50]}...")
 
     try:
-        # 유사 청크 검색
-        chunks = await search_similar_chunks(request.query, top_k=10)
+        # 1. 쿼리 분석
+        analysis = analyze_query(request.query)
+        logger.info(f"Query analysis: {analysis}")
 
-        # Claude로 답변 생성
+        # 2. 분석 결과로 검색 (rewritten_query + 필터)
+        chunks = await search_similar_chunks(
+            query=analysis.rewritten_query,
+            top_k=10,
+            date_from=analysis.date_from,
+            date_to=analysis.date_to,
+            sender=analysis.sender_filter,
+        )
+
+        # 3. 원본 질문으로 답변 생성
         result = generate_answer(request.query, chunks)
 
         # 응답 파싱
         parsed = parse_citations_response(result["content"], result["sources"])
+
+        analysis_info = QueryAnalysisInfo(
+            original_query=request.query,
+            rewritten_query=analysis.rewritten_query,
+            date_from=str(analysis.date_from) if analysis.date_from else None,
+            date_to=str(analysis.date_to) if analysis.date_to else None,
+            sender_filter=analysis.sender_filter,
+            keywords=analysis.keywords,
+            chunks_found=len(chunks),
+        )
 
         return ChatResponse(
             text=parsed["text"],
@@ -128,7 +159,8 @@ async def chat(request: ChatRequest):
                 "from_address": s.get("from_address", ""),
                 "received_at": str(s.get("received_at", ""))[:10],
                 "score": s.get("score", 0)
-            } for s in result["sources"]]
+            } for s in result["sources"]],
+            analysis=analysis_info,
         )
 
     except Exception as e:

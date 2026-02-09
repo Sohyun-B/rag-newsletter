@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from .connection import execute_query, execute_command, execute_insert_returning_id
@@ -151,3 +151,37 @@ def get_newsletter_count() -> int:
     """뉴스레터 총 개수"""
     results = execute_query("SELECT COUNT(*) as count FROM newsletter.raw_email")
     return results[0]["count"] if results else 0
+
+
+def get_email_ids_by_filters(
+    date_from: date | None = None,
+    date_to: date | None = None,
+    sender: str | None = None,
+) -> list[int]:
+    """날짜/발신인 조건으로 email_id 목록 조회 (Chroma에 벡터가 있는 것만)"""
+    conditions = []
+    params = []
+
+    if date_from:
+        conditions.append("re.received_at >= ?")
+        params.append(datetime.combine(date_from, datetime.min.time()))
+    if date_to:
+        conditions.append("re.received_at < ?")
+        # date_to의 다음날 00:00까지 포함
+        params.append(datetime.combine(date_to + timedelta(days=1), datetime.min.time()))
+    if sender:
+        conditions.append("re.from_address LIKE ?")
+        params.append(f"%{sender}%")
+
+    if not conditions:
+        return []
+
+    where_clause = " AND ".join(conditions)
+    query = f"""
+        SELECT DISTINCT re.id
+        FROM newsletter.raw_email re
+        INNER JOIN newsletter.email_chunks ec ON ec.email_id = re.id
+        WHERE {where_clause}
+    """
+    results = execute_query(query, tuple(params))
+    return [row["id"] for row in results]

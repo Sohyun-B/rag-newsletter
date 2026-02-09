@@ -12,9 +12,6 @@ class Settings(BaseSettings):
     # OpenAI
     OPENAI_API_KEY: str
 
-    # Anthropic
-    ANTHROPIC_API_KEY: str
-
     # Chroma
     CHROMA_PATH: str = "./chroma_data"
 

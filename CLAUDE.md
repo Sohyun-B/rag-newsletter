@@ -9,7 +9,7 @@ Newsletter RAG System - 상세 구현 계획
 ├────────────┼────────────────────────────────┼──────────────────────────────────────┤
 │ 인프라     │ Docker Compose (로컬)          │ Backend + Frontend 컨테이너          │
 ├────────────┼────────────────────────────────┼──────────────────────────────────────┤
-│ LLM        │ Claude (Anthropic API)         │ Citations API 활용하여 출처 표시     │
+│ LLM        │ OpenAI gpt-4o-mini             │ 쿼리 분석 + 답변 생성 모두 사용      │
 ├────────────┼────────────────────────────────┼──────────────────────────────────────┤
 │ 임베딩     │ OpenAI text-embedding-3-small  │ 1536차원, $0.02/1M tokens            │
 ├────────────┼────────────────────────────────┼──────────────────────────────────────┤
@@ -41,6 +41,11 @@ Newsletter RAG System - 상세 구현 계획
 │ DB 아키텍처      │ MSSQL(직접 연결, 메타데이터) + Chroma(로컬 파일, 벡터)      │
 ├──────────────────┼─────────────────────────────────────────────────────────────┤
 │ DB 스키마        │ newsletter (newsletter.raw_email, newsletter.email_chunks)  │
+├──────────────────┼─────────────────────────────────────────────────────────────┤
+│ 쿼리 분석       │ gpt-4o-mini JSON mode로 질문 → 검색 계획 생성               │
+│                  │ LLM이 직접 날짜(YYYY-MM-DD) 계산, 서술형 쿼리 변환         │
+├──────────────────┼─────────────────────────────────────────────────────────────┤
+│ 메타데이터 필터  │ MSSQL pre-filter → Chroma where 필터 ($in email_id)        │
 └──────────────────┴─────────────────────────────────────────────────────────────┘
 
 ---
@@ -99,8 +104,9 @@ RAG/
 │   ├── vectorstore/
 │   │   └── chroma_store.py       # Chroma 벡터 저장소 관리
 │   ├── rag/
-│   │   ├── search.py             # Chroma 유사도 검색 + MSSQL 메타데이터 조회
-│   │   └── agent.py              # Claude Citations API 답변 생성
+│   │   ├── query_analyzer.py     # gpt-4o-mini 쿼리 분석 (날짜/발신인 필터, 쿼리 변환)
+│   │   ├── search.py             # Chroma 유사도 검색 + MSSQL 메타데이터 조회 (필터 지원)
+│   │   └── agent.py              # OpenAI Chat Completions 답변 생성
 │   ├── utils/
 │   │   └── retry.py              # 지수 백오프 재시도 유틸리티
 │   └── scheduler.py              # APScheduler 주기적 Gmail 폴링
@@ -225,7 +231,6 @@ fastapi==0.115.*
 uvicorn[standard]==0.34.*
 pyodbc==5.*                        # MSSQL 연결
 pydantic-settings==2.*
-anthropic==0.45.*
 openai==1.60.*
 chromadb==0.5.*                    # 벡터 저장소
 google-auth==2.*
@@ -361,6 +366,19 @@ def search_similar(
         include=["documents", "metadatas", "distances"]
     )
     return results
+
+def search_similar_filtered(
+    query_embedding: list[float],
+    email_ids: list[int],
+    top_k: int = 10,
+) -> dict:
+    """email_id 필터를 적용한 유사 벡터 검색"""
+    return collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
+        where={"email_id": {"$in": email_ids}},
+        include=["documents", "metadatas", "distances"],
+    )
 
 def generate_chroma_id() -> str:
     """고유 Chroma ID 생성"""
@@ -565,134 +583,172 @@ async def process_unprocessed_emails():
     """
 
 ---
-Step 5: RAG 검색 + Claude 답변
+Step 5: 쿼리 분석 + RAG 검색 + 답변
 
-5-1. rag/search.py - 벡터 유사도 검색
+전체 흐름:
+```
+질문 → gpt-4o-mini 쿼리 분석 → 조건부 검색 → gpt-4o-mini 답변
+              │                      │
+              ├ rewritten_query       ├ 필터 있으면: MSSQL pre-filter → Chroma where 검색
+              ├ date_from (YYYY-MM-DD)└ 필터 없으면: Chroma 전체 검색
+              ├ date_to (YYYY-MM-DD)
+              ├ sender_filter
+              └ keywords
+```
 
-from vectorstore.chroma_store import search_similar
-from db.queries import get_chunks_by_chroma_ids
-from etl.embedder import embed_chunks
+5-0. rag/query_analyzer.py - LLM 쿼리 분석
 
-async def search_similar_chunks(query: str, top_k: int = 10) -> list[dict]:
+gpt-4o-mini에 JSON mode로 요청하여 검색 계획을 생성한다.
+LLM이 오늘 날짜와 요일을 기준으로 직접 YYYY-MM-DD 날짜를 계산한다.
+(중간 포맷 없이 LLM이 직접 계산 → _resolve 변환 불필요)
+
+from openai import OpenAI
+from dataclasses import dataclass
+from datetime import date
+
+@dataclass
+class QueryAnalysis:
+    rewritten_query: str        # 검색용 서술형 변환
+    date_from: date | None      # 시작 날짜 (LLM이 직접 계산)
+    date_to: date | None        # 종료 날짜 (LLM이 직접 계산)
+    sender_filter: str | None   # 발신인 필터
+    keywords: list[str]         # 핵심 키워드
+
+QUERY_ANALYSIS_PROMPT = """당신은 뉴스레터 검색 시스템의 쿼리 플래너입니다.
+사용자의 자연어 질문을 분석하여, 벡터 검색과 SQL 필터에 사용할 검색 계획을 JSON으로 생성하세요.
+
+오늘 날짜: {today} ({weekday})
+
+JSON 형식:
+{{
+  "rewritten_query": "벡터 유사도 검색에 최적화된 서술형 문장",
+  "date_from": "YYYY-MM-DD 또는 null",
+  "date_to": "YYYY-MM-DD 또는 null",
+  "sender_filter": "발신인/뉴스레터명 또는 null",
+  "keywords": ["핵심", "키워드"]
+}}
+
+지침:
+1. rewritten_query: 질문형을 제거하고, 핵심 주제를 서술형으로 변환
+2. date_from / date_to: 오늘 날짜 기준으로 직접 계산하여 YYYY-MM-DD로 기입
+   - 시간 표현이 전혀 없는 순수 주제 질문만 null로 설정
+3. sender_filter: 특정 뉴스레터/발신인이 언급된 경우만
+4. keywords: 검색의 핵심 키워드 추출"""
+
+def analyze_query(query: str) -> QueryAnalysis:
+    # gpt-4o-mini JSON mode 호출
+    # 응답의 date_from/date_to 문자열 → date 파싱
+    # 실패 시 원본 query + 필터 없음으로 fallback
+
+5-1. rag/search.py - 벡터 유사도 검색 (필터 지원)
+
+async def search_similar_chunks(
+    query: str,
+    top_k: int = 10,
+    score_threshold: float = 0.3,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    sender: str | None = None,
+) -> list[dict]:
     """
-    1. query를 임베딩으로 변환
-    2. Chroma에서 유사 벡터 검색 → chroma_id 목록
-    3. MSSQL에서 chroma_id로 메타데이터 조회
-    4. 결과 병합하여 반환
+    1. 필터 존재 시: MSSQL에서 email_ids 조회 (get_email_ids_by_filters)
+    2. query를 임베딩으로 변환
+    3. 필터 있으면: Chroma where 필터 검색 (search_similar_filtered)
+       필터 없으면: Chroma 전체 검색 (search_similar)
+    4. MSSQL에서 chroma_id로 메타데이터 조회
+    5. 점수 변환 + 필터링 + 정렬
     """
-    # 쿼리 임베딩
-    query_embedding = (await embed_chunks([query]))[0]
 
-    # Chroma 검색
-    results = search_similar(query_embedding, top_k)
+5-2. rag/agent.py - OpenAI Chat Completions 답변 생성
 
-    if not results['ids'][0]:
-        return []
-
-    # MSSQL에서 메타데이터 조회
-    chroma_ids = results['ids'][0]
-    distances = results['distances'][0]
-
-    chunks = get_chunks_by_chroma_ids(chroma_ids)
-
-    # 거리 정보 추가 (코사인 거리 → 유사도)
-    for chunk, distance in zip(chunks, distances):
-        chunk['score'] = 1 - distance
-
-    return chunks
-
-5-2. rag/agent.py - Claude Citations API 답변 생성
-
-import anthropic
+from openai import OpenAI
 from utils.retry import with_retry
 
-client = anthropic.Anthropic()
+client = OpenAI()
+MODEL = "gpt-4o-mini"
+
+SYSTEM_PROMPT = """당신은 뉴스레터 지식 검색 어시스턴트입니다.
+제공된 뉴스레터 문서를 기반으로 질문에 답변하세요.
+답변 시 반드시 출처 번호를 [1], [2] 형식으로 인용하여 답변하세요.
+문서에 없는 내용은 '관련 뉴스레터를 찾지 못했습니다'라고 답하세요.
+한국어로 답변하세요."""
 
 @with_retry(max_retries=3, base_delay=1.0)
-async def generate_answer(query: str, chunks: list[dict]) -> dict:
-    """Claude Citations API로 답변 생성"""
-    content = []
-    for chunk in chunks:
-        content.append({
-            "type": "document",
-            "source": {
-                "type": "text",
-                "media_type": "text/plain",
-                "data": chunk["content"],
-            },
-            "title": f"{chunk['subject']} ({chunk['from_address']}, {chunk['received_at'][:10]})",
-            "citations": {"enabled": True}
-        })
-
-    content.append({"type": "text", "text": query})
-
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+def generate_answer(query: str, chunks: list[dict]) -> dict:
+    """OpenAI Chat Completions로 답변 생성"""
+    context = _build_context(chunks)  # 청크를 [문서 1] ... 형태로 조합
+    response = client.chat.completions.create(
+        model=MODEL,
         max_tokens=2048,
-        messages=[{"role": "user", "content": content}],
-        system="당신은 뉴스레터 지식 검색 어시스턴트입니다. "
-               "제공된 뉴스레터 문서를 기반으로 질문에 답변하세요. "
-               "반드시 출처를 인용하여 답변하세요. "
-               "문서에 없는 내용은 '관련 뉴스레터를 찾지 못했습니다'라고 답하세요."
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"다음은 검색된 뉴스레터 문서입니다:\n\n{context}\n\n질문: {query}"}
+        ]
     )
+    return {"content": response.choices[0].message.content, "sources": chunks}
 
-    return {
-        "content": response.content,
-        "sources": chunks
-    }
+5-3. 응답 파싱
 
-5-3. Citations API 응답 파싱
-
-def parse_citations_response(content_blocks: list, sources: list[dict]) -> dict:
-    """Claude Citations 응답을 프론트엔드 표시용으로 파싱"""
-    full_text = ""
-    citations = []
-    citation_counter = 0
-
-    for block in content_blocks:
-        if block.type == "text":
-            text = block.text
-            if hasattr(block, 'citations') and block.citations:
-                citation_indices = []
-                for citation in block.citations:
-                    citation_counter += 1
-                    doc_idx = citation.document_index
-                    citations.append({
-                        "index": citation_counter,
-                        "cited_text": citation.cited_text,
-                        "source": sources[doc_idx] if doc_idx < len(sources) else None
-                    })
-                    citation_indices.append(str(citation_counter))
-                text += f" [{','.join(citation_indices)}]"
-            full_text += text
-
-    return {"text": full_text, "citations": citations}
+def parse_citations_response(content: str, sources: list[dict]) -> dict:
+    """OpenAI 응답을 프론트엔드 표시용으로 파싱"""
+    # 각 source에 대해 인용 정보 생성
+    # {text: 답변 텍스트, citations: [{index, source: {subject, from, date}}]}
 
 ---
 Step 6: FastAPI 엔드포인트
 
 from pydantic import BaseModel
-from rag.search import search_similar_chunks
-from rag.agent import generate_answer, parse_citations_response
+from rag import search_similar_chunks, generate_answer, parse_citations_response, analyze_query
 
 class ChatRequest(BaseModel):
     query: str
+
+class QueryAnalysisInfo(BaseModel):
+    original_query: str
+    rewritten_query: str
+    date_from: str | None
+    date_to: str | None
+    sender_filter: str | None
+    keywords: list[str]
+    chunks_found: int
 
 class ChatResponse(BaseModel):
     text: str
     citations: list[dict]
     sources: list[dict]
+    analysis: QueryAnalysisInfo | None = None   # 쿼리 분석 중간과정
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """RAG 채팅 엔드포인트"""
-    chunks = await search_similar_chunks(request.query)
-    result = await generate_answer(request.query, chunks)
+    # 1. 쿼리 분석 (gpt-4o-mini)
+    analysis = analyze_query(request.query)
+
+    # 2. 분석 결과로 검색 (rewritten_query + 필터)
+    chunks = await search_similar_chunks(
+        query=analysis.rewritten_query,
+        date_from=analysis.date_from,
+        date_to=analysis.date_to,
+        sender=analysis.sender_filter,
+    )
+
+    # 3. 원본 질문으로 답변 생성
+    result = generate_answer(request.query, chunks)
     parsed = parse_citations_response(result["content"], result["sources"])
+
     return ChatResponse(
         text=parsed["text"],
         citations=parsed["citations"],
-        sources=result["sources"]
+        sources=result["sources"],
+        analysis=QueryAnalysisInfo(
+            original_query=request.query,
+            rewritten_query=analysis.rewritten_query,
+            date_from=str(analysis.date_from) if analysis.date_from else None,
+            date_to=str(analysis.date_to) if analysis.date_to else None,
+            sender_filter=analysis.sender_filter,
+            keywords=analysis.keywords,
+            chunks_found=len(chunks),
+        ),
     )
 
 @app.post("/sync")
@@ -746,10 +802,22 @@ if prompt := st.chat_input("뉴스레터에 대해 질문하세요"):
         response = httpx.post(f"{BACKEND_URL}/chat", json={"query": prompt}, timeout=30)
         answer = response.json()
 
+    # 쿼리 분석 과정 표시 (expander)
+    if answer.get("analysis"):
+        with st.expander("🔍 쿼리 분석 과정"):
+            a = answer["analysis"]
+            st.markdown(f"**변환된 검색어:** {a['rewritten_query']}")
+            if a.get("date_from"):
+                st.markdown(f"**날짜 필터:** {a['date_from']} ~ {a['date_to']}")
+            if a.get("sender_filter"):
+                st.markdown(f"**발신인 필터:** {a['sender_filter']}")
+            st.markdown(f"**검색된 청크 수:** {a['chunks_found']}개")
+
     st.session_state.messages.append({
         "role": "assistant",
         "content": answer["text"],
-        "citations": answer.get("citations", [])
+        "citations": answer.get("citations", []),
+        "analysis": answer.get("analysis"),
     })
     st.rerun()
 
@@ -762,11 +830,8 @@ MSSQL_DATABASE=project_pm
 MSSQL_USER=sa
 MSSQL_PASSWORD=YourStrongPassword123!
 
-# OpenAI (임베딩용)
+# OpenAI (임베딩 + 쿼리 분석 + 답변 생성)
 OPENAI_API_KEY=sk-proj-...
-
-# Anthropic (Claude LLM)
-ANTHROPIC_API_KEY=sk-ant-api03-...
 
 # 선택 설정 (기본값 있음)
 # CHROMA_PATH=./chroma_data

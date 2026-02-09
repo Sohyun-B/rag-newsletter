@@ -57,6 +57,25 @@ def search_similar(
         raise
 
 
+def search_similar_filtered(
+    query_embedding: list[float],
+    email_ids: list[int],
+    top_k: int = 10,
+) -> dict:
+    """email_id 필터를 적용한 유사 벡터 검색"""
+    try:
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k,
+            where={"email_id": {"$in": email_ids}},
+            include=["documents", "metadatas", "distances"],
+        )
+        return results
+    except Exception as e:
+        logger.error(f"Failed to filtered search: {e}")
+        raise
+
+
 def generate_chroma_id() -> str:
     """고유 Chroma ID 생성"""
     return str(uuid.uuid4())

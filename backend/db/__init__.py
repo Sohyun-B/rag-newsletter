@@ -10,4 +10,5 @@ from .queries import (
     get_newsletters,
     get_newsletter_by_id,
     get_newsletter_count,
+    get_email_ids_by_filters,
 )

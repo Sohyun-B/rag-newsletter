@@ -113,6 +113,20 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
+        # 쿼리 분석 결과 표시
+        if message["role"] == "assistant" and message.get("analysis"):
+            a = message["analysis"]
+            with st.expander("🔍 쿼리 분석 과정", expanded=False):
+                st.markdown(f"**원본 질문:** {a.get('original_query', '')}")
+                st.markdown(f"**변환된 검색어:** {a.get('rewritten_query', '')}")
+                if a.get("date_from") or a.get("date_to"):
+                    st.markdown(f"**날짜 필터:** {a.get('date_from', '?')} ~ {a.get('date_to', '?')}")
+                if a.get("sender_filter"):
+                    st.markdown(f"**발신인 필터:** {a['sender_filter']}")
+                if a.get("keywords"):
+                    st.markdown(f"**키워드:** {', '.join(a['keywords'])}")
+                st.markdown(f"**검색된 청크 수:** {a.get('chunks_found', 0)}개")
+
         # 출처 표시 (assistant 메시지만)
         if message["role"] == "assistant" and message.get("citations"):
             with st.expander("📚 출처 보기", expanded=False):
@@ -142,6 +156,20 @@ if prompt := st.chat_input("뉴스레터에 대해 질문하세요"):
         if response:
             answer_text = response.get("text", "응답을 생성할 수 없습니다.")
             citations = response.get("citations", [])
+            analysis = response.get("analysis")
+
+            # 쿼리 분석 과정 표시
+            if analysis:
+                with st.expander("🔍 쿼리 분석 과정", expanded=True):
+                    st.markdown(f"**원본 질문:** {analysis.get('original_query', '')}")
+                    st.markdown(f"**변환된 검색어:** {analysis.get('rewritten_query', '')}")
+                    if analysis.get("date_from") or analysis.get("date_to"):
+                        st.markdown(f"**날짜 필터:** {analysis.get('date_from', '?')} ~ {analysis.get('date_to', '?')}")
+                    if analysis.get("sender_filter"):
+                        st.markdown(f"**발신인 필터:** {analysis['sender_filter']}")
+                    if analysis.get("keywords"):
+                        st.markdown(f"**키워드:** {', '.join(analysis['keywords'])}")
+                    st.markdown(f"**검색된 청크 수:** {analysis.get('chunks_found', 0)}개")
 
             st.markdown(answer_text)
 
@@ -163,7 +191,8 @@ if prompt := st.chat_input("뉴스레터에 대해 질문하세요"):
             st.session_state.messages.append({
                 "role": "assistant",
                 "content": answer_text,
-                "citations": citations
+                "citations": citations,
+                "analysis": analysis,
             })
         else:
             error_msg = "응답을 받을 수 없습니다. 백엔드 연결을 확인하세요."
