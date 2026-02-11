@@ -26,15 +26,15 @@ def sync_job():
     스케줄러에서 실행되는 동기화 작업
     Gmail 동기화 + ETL 처리
     """
-    from gmail import sync_gmail
+    from gmail import fetch_emails_by_senders
     from etl import process_unprocessed_emails
 
-    logger.info("Scheduled sync job started")
+    logger.info(f"Scheduled sync job started (senders: {len(settings.SYNC_SENDERS)})")
 
     try:
-        # Gmail 동기화
-        gmail_result = sync_gmail()
-        logger.info(f"Gmail sync: {gmail_result.get('inserted_count', 0)} new emails")
+        # 발신인 기반 Gmail 동기화
+        inserted = fetch_emails_by_senders(settings.SYNC_SENDERS)
+        logger.info(f"Gmail sync: {len(inserted)} new emails")
 
         # ETL 처리
         etl_result = run_async(process_unprocessed_emails())

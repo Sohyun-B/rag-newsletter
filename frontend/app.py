@@ -22,7 +22,8 @@ st.caption("뉴스레터 기반 지식 검색 시스템")
 def call_api(method: str, endpoint: str, **kwargs) -> dict | None:
     """Backend API 호출"""
     try:
-        with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
+        req_timeout = kwargs.pop("timeout", REQUEST_TIMEOUT)
+        with httpx.Client(timeout=req_timeout) as client:
             url = f"{BACKEND_URL}{endpoint}"
             if method == "GET":
                 response = client.get(url, **kwargs)
@@ -72,8 +73,8 @@ with st.sidebar:
 
     st.header("🔄 동기화")
     if st.button("지금 동기화", use_container_width=True):
-        with st.spinner("Gmail 동기화 중..."):
-            result = call_api("POST", "/sync")
+        with st.spinner("Gmail 동기화 중... (최대 10분 소요)"):
+            result = call_api("POST", "/sync", timeout=600.0)
             if result:
                 gmail = result.get("gmail_result", {})
                 etl = result.get("etl_result", {})
@@ -102,6 +103,80 @@ with st.sidebar:
         st.info("수집된 뉴스레터가 없습니다.")
 
 
+# ============ Helper: 쿼리 분석 파이프라인 표시 ============
+
+def render_analysis(a: dict, expanded: bool = False):
+    """쿼리 분석 과정을 단계별 파이프라인으로 표시"""
+    if not a:
+        return
+
+    needs_retrieval = a.get("needs_retrieval", True)
+
+    with st.expander("🔍 쿼리 분석 파이프라인", expanded=expanded):
+        # --- Step 1: Routing ---
+        st.markdown("**Step 1. Routing**")
+        if needs_retrieval:
+            st.success("검색 필요 → RAG 파이프라인 실행")
+        else:
+            st.info("검색 불필요 → 직접 답변")
+            return
+
+        st.divider()
+
+        # --- Step 2: Query Rewrite ---
+        st.markdown("**Step 2. Query Rewrite**")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.caption("원본 질문")
+            st.markdown(f"`{a.get('original_query', '')}`")
+        with col2:
+            st.caption("변환된 검색어")
+            st.markdown(f"`{a.get('rewritten_query', '')}`")
+
+        if a.get("keywords"):
+            st.caption(f"키워드: {', '.join(a['keywords'])}")
+
+        st.divider()
+
+        # --- Step 3: HyDE ---
+        st.markdown("**Step 3. HyDE (Hypothetical Document)**")
+        if a.get("hypothetical_document"):
+            st.markdown(f"> {a['hypothetical_document']}")
+        else:
+            st.caption("가상 문서 없음")
+
+        st.divider()
+
+        # --- Step 4: Multi-Query ---
+        st.markdown("**Step 4. Multi-Query Expansion**")
+        if a.get("multi_queries"):
+            for i, mq in enumerate(a["multi_queries"], 1):
+                st.markdown(f"  {i}. `{mq}`")
+        else:
+            st.caption("다중 쿼리 없음")
+
+        st.divider()
+
+        # --- Step 5: Filters + Results ---
+        st.markdown("**Step 5. 검색 실행**")
+        filter_parts = []
+        if a.get("date_from") or a.get("date_to"):
+            filter_parts.append(f"날짜: {a.get('date_from', '?')} ~ {a.get('date_to', '?')}")
+        if a.get("sender_filter"):
+            filter_parts.append(f"발신인: {a['sender_filter']}")
+
+        if filter_parts:
+            st.caption("필터: " + " | ".join(filter_parts))
+        else:
+            st.caption("필터 없음 (전체 검색)")
+
+        chunks_found = a.get("chunks_found", 0)
+        if chunks_found > 0:
+            st.success(f"검색 결과: {chunks_found}개 청크")
+        else:
+            st.warning("검색 결과: 0개 청크")
+
+
 # ============ Main Chat Interface ============
 
 # 채팅 기록 초기화
@@ -115,17 +190,7 @@ for message in st.session_state.messages:
 
         # 쿼리 분석 결과 표시
         if message["role"] == "assistant" and message.get("analysis"):
-            a = message["analysis"]
-            with st.expander("🔍 쿼리 분석 과정", expanded=False):
-                st.markdown(f"**원본 질문:** {a.get('original_query', '')}")
-                st.markdown(f"**변환된 검색어:** {a.get('rewritten_query', '')}")
-                if a.get("date_from") or a.get("date_to"):
-                    st.markdown(f"**날짜 필터:** {a.get('date_from', '?')} ~ {a.get('date_to', '?')}")
-                if a.get("sender_filter"):
-                    st.markdown(f"**발신인 필터:** {a['sender_filter']}")
-                if a.get("keywords"):
-                    st.markdown(f"**키워드:** {', '.join(a['keywords'])}")
-                st.markdown(f"**검색된 청크 수:** {a.get('chunks_found', 0)}개")
+            render_analysis(message["analysis"], expanded=False)
 
         # 출처 표시 (assistant 메시지만)
         if message["role"] == "assistant" and message.get("citations"):
@@ -160,16 +225,7 @@ if prompt := st.chat_input("뉴스레터에 대해 질문하세요"):
 
             # 쿼리 분석 과정 표시
             if analysis:
-                with st.expander("🔍 쿼리 분석 과정", expanded=True):
-                    st.markdown(f"**원본 질문:** {analysis.get('original_query', '')}")
-                    st.markdown(f"**변환된 검색어:** {analysis.get('rewritten_query', '')}")
-                    if analysis.get("date_from") or analysis.get("date_to"):
-                        st.markdown(f"**날짜 필터:** {analysis.get('date_from', '?')} ~ {analysis.get('date_to', '?')}")
-                    if analysis.get("sender_filter"):
-                        st.markdown(f"**발신인 필터:** {analysis['sender_filter']}")
-                    if analysis.get("keywords"):
-                        st.markdown(f"**키워드:** {', '.join(analysis['keywords'])}")
-                    st.markdown(f"**검색된 청크 수:** {analysis.get('chunks_found', 0)}개")
+                render_analysis(analysis, expanded=True)
 
             st.markdown(answer_text)
 

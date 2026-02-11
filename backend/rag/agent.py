@@ -20,6 +20,11 @@ SYSTEM_PROMPT = """당신은 뉴스레터 지식 검색 어시스턴트입니다
 문서에 없는 내용은 '관련 뉴스레터를 찾지 못했습니다'라고 답하세요.
 한국어로 답변하세요."""
 
+DIRECT_ANSWER_PROMPT = """당신은 뉴스레터 검색 어시스턴트입니다.
+현재 질문은 뉴스레터 검색이 필요하지 않습니다.
+친절하고 자연스럽게 한국어로 답변하세요.
+뉴스레터에 대한 질문이 있으면 언제든 물어봐달라고 안내하세요."""
+
 
 def format_date(date_value: Any) -> str:
     """날짜를 읽기 쉬운 형식으로 변환"""
@@ -121,4 +126,32 @@ def parse_citations_response(
     return {
         "text": content,
         "citations": citations
+    }
+
+
+@with_retry(max_retries=3, base_delay=1.0, exceptions=(Exception,))
+def generate_direct_answer(query: str) -> dict[str, Any]:
+    """
+    검색 없이 직접 답변 (인사말, 시스템 질문 등)
+
+    Args:
+        query: 사용자 질문
+
+    Returns:
+        {content: 응답 텍스트, sources: []}
+    """
+    logger.info(f"Generating direct answer for: {query[:50]}...")
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        max_tokens=512,
+        messages=[
+            {"role": "system", "content": DIRECT_ANSWER_PROMPT},
+            {"role": "user", "content": query}
+        ]
+    )
+
+    return {
+        "content": response.choices[0].message.content,
+        "sources": []
     }

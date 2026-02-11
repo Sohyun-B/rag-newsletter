@@ -22,6 +22,19 @@ class Settings(BaseSettings):
     # Scheduler
     SYNC_INTERVAL_MINUTES: int = 5
 
+    # 동기화 대상 발신인
+    SYNC_SENDERS: list[str] = [
+        "whatsup@newneek.co",
+        "dig@mk.co.kr",
+        "nytdirect@nytimes.com",
+        "nytimes@e.newyorktimes.com",
+        "editorpicks@nytimes.com",
+        "newsletters@theatlantic.com",
+        "modulabs01-gmail.com@send.stibee.com",
+        "letter@khan.kr",
+        "contact@datarian.io",
+    ]
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

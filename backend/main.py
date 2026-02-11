@@ -11,7 +11,7 @@ from db import test_connection, get_newsletters, get_newsletter_by_id, get_newsl
 from vectorstore import get_collection_count
 from gmail import sync_gmail, fetch_emails_by_senders, test_gmail_connection
 from etl import process_unprocessed_emails
-from rag import search_similar_chunks, generate_answer, parse_citations_response, analyze_query
+from rag import search_similar_chunks, generate_answer, parse_citations_response, analyze_query, generate_direct_answer
 from scheduler import start_scheduler, stop_scheduler, get_scheduler_status
 
 # 로깅 설정
@@ -60,12 +60,15 @@ class ChatRequest(BaseModel):
 
 class QueryAnalysisInfo(BaseModel):
     original_query: str
+    needs_retrieval: bool
     rewritten_query: str
-    date_from: str | None
-    date_to: str | None
-    sender_filter: str | None
-    keywords: list[str]
-    chunks_found: int
+    hypothetical_document: str | None = None
+    multi_queries: list[str] = []
+    date_from: str | None = None
+    date_to: str | None = None
+    sender_filter: str | None = None
+    keywords: list[str] = []
+    chunks_found: int = 0
 
 
 class ChatResponse(BaseModel):
@@ -122,28 +125,37 @@ async def chat(request: ChatRequest):
     logger.info(f"Chat request: {request.query[:50]}...")
 
     try:
-        # 1. 쿼리 분석
+        # 1. 쿼리 분석 (routing + HyDE + multi-query)
         analysis = analyze_query(request.query)
-        logger.info(f"Query analysis: {analysis}")
+        logger.info(f"Query analysis: needs_retrieval={analysis.needs_retrieval}")
 
-        # 2. 분석 결과로 검색 (rewritten_query + 필터)
-        chunks = await search_similar_chunks(
-            query=analysis.rewritten_query,
-            top_k=10,
-            date_from=analysis.date_from,
-            date_to=analysis.date_to,
-            sender=analysis.sender_filter,
-        )
-
-        # 3. 원본 질문으로 답변 생성
-        result = generate_answer(request.query, chunks)
+        if not analysis.needs_retrieval:
+            # 검색 불필요 → 직접 답변
+            result = generate_direct_answer(request.query)
+            chunks = []
+        else:
+            # 검색 필요 → HyDE + Multi-Query 검색
+            chunks = await search_similar_chunks(
+                query=analysis.rewritten_query,
+                hypothetical_doc=analysis.hypothetical_document,
+                multi_queries=analysis.multi_queries,
+                top_k=10,
+                date_from=analysis.date_from,
+                date_to=analysis.date_to,
+                sender=analysis.sender_filter,
+            )
+            # 원본 질문으로 답변 생성
+            result = generate_answer(request.query, chunks)
 
         # 응답 파싱
         parsed = parse_citations_response(result["content"], result["sources"])
 
         analysis_info = QueryAnalysisInfo(
             original_query=request.query,
+            needs_retrieval=analysis.needs_retrieval,
             rewritten_query=analysis.rewritten_query,
+            hypothetical_document=analysis.hypothetical_document,
+            multi_queries=analysis.multi_queries,
             date_from=str(analysis.date_from) if analysis.date_from else None,
             date_to=str(analysis.date_to) if analysis.date_to else None,
             sender_filter=analysis.sender_filter,
@@ -197,24 +209,27 @@ async def sync_by_senders(request: SyncBySendersRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/sync", response_model=SyncResponse)
+@app.post("/sync")
 async def manual_sync():
     """
-    수동 Gmail 동기화 + ETL 실행
+    수동 Gmail 동기화 + ETL 실행 (설정된 발신인 기준)
     """
-    logger.info("Manual sync triggered")
+    logger.info(f"Manual sync triggered (senders: {settings.SYNC_SENDERS})")
 
     try:
-        # Gmail 동기화
-        gmail_result = sync_gmail()
+        # 발신인 기반 Gmail 동기화
+        inserted = fetch_emails_by_senders(settings.SYNC_SENDERS)
 
         # ETL 처리
         etl_result = await process_unprocessed_emails()
 
-        return SyncResponse(
-            gmail_result=gmail_result,
-            etl_result=etl_result
-        )
+        return {
+            "gmail_result": {
+                "inserted_count": len(inserted),
+                "senders": settings.SYNC_SENDERS,
+            },
+            "etl_result": etl_result,
+        }
 
     except Exception as e:
         logger.error(f"Sync error: {e}")
