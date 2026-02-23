@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import date
 from typing import Any
@@ -5,6 +6,7 @@ from typing import Any
 from vectorstore import search_similar, search_similar_filtered
 from db import get_chunks_by_chroma_ids, get_email_ids_by_filters
 from etl import embed_chunks
+from .query_analyzer import SubQuery
 
 logger = logging.getLogger(__name__)
 
@@ -111,3 +113,80 @@ async def search_similar_chunks(
 
     logger.info(f"Returning {len(filtered_chunks)} chunks after filtering")
     return filtered_chunks
+
+
+async def search_with_sub_queries(
+    sub_queries: list[SubQuery],
+    top_k_per_query: int = 10,
+    final_top_k: int = 15,
+    score_threshold: float = 0.3,
+) -> tuple[list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+    """
+    서브쿼리별 독립 검색 후 결과 집계
+
+    Args:
+        sub_queries: 검색할 서브쿼리 리스트
+        top_k_per_query: 서브쿼리당 최대 결과 수
+        final_top_k: 최종 병합 결과 최대 수
+        score_threshold: 최소 유사도 점수
+
+    Returns:
+        (merged_chunks, per_subquery_chunks)
+        - merged_chunks: 전체 통합 결과 (중복 제거, 점수순)
+        - per_subquery_chunks: 서브쿼리 purpose별 결과
+    """
+    logger.info(f"Searching with {len(sub_queries)} sub-queries")
+
+    # 각 서브쿼리를 병렬 실행
+    tasks = [
+        search_similar_chunks(
+            query=sq.query,
+            hypothetical_doc=sq.hypothetical_document,
+            multi_queries=sq.multi_queries,
+            top_k=top_k_per_query,
+            score_threshold=score_threshold,
+            date_from=sq.date_from,
+            date_to=sq.date_to,
+            sender=sq.sender_filter,
+        )
+        for sq in sub_queries
+    ]
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # 서브쿼리별 결과 수집 + 전체 병합
+    per_subquery_chunks: dict[str, list[dict[str, Any]]] = {}
+    merged: dict[str, dict[str, Any]] = {}  # chroma_id -> chunk (best score)
+
+    for i, (sq, result) in enumerate(zip(sub_queries, results)):
+        # purpose 키 중복 방지: 빈 문자열이거나 이미 존재하면 suffix 부여
+        base_purpose = sq.purpose or f"서브쿼리 {i + 1}"
+        purpose_key = base_purpose
+        suffix = 2
+        while purpose_key in per_subquery_chunks:
+            purpose_key = f"{base_purpose} ({suffix})"
+            suffix += 1
+
+        if isinstance(result, Exception):
+            logger.error(f"Sub-query '{purpose_key}' failed: {result}")
+            per_subquery_chunks[purpose_key] = []
+            continue
+
+        per_subquery_chunks[purpose_key] = result
+
+        for chunk in result:
+            cid = chunk.get("chroma_id")
+            if not cid:
+                continue
+            if cid not in merged or chunk["score"] > merged[cid]["score"]:
+                merged[cid] = chunk
+
+    # 점수순 정렬 + 제한
+    merged_chunks = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+    merged_chunks = merged_chunks[:final_top_k]
+
+    logger.info(
+        f"Sub-query search done: {sum(len(v) for v in per_subquery_chunks.values())} total, "
+        f"{len(merged_chunks)} merged"
+    )
+    return merged_chunks, per_subquery_chunks

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
@@ -11,7 +12,11 @@ from db import test_connection, get_newsletters, get_newsletter_by_id, get_newsl
 from vectorstore import get_collection_count
 from gmail import sync_gmail, fetch_emails_by_senders, test_gmail_connection
 from etl import process_unprocessed_emails
-from rag import search_similar_chunks, generate_answer, parse_citations_response, analyze_query, generate_direct_answer
+from rag import (
+    search_similar_chunks, search_with_sub_queries,
+    generate_answer, generate_structured_answer,
+    parse_citations_response, analyze_query, generate_direct_answer,
+)
 from scheduler import start_scheduler, stop_scheduler, get_scheduler_status
 
 # 로깅 설정
@@ -38,7 +43,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Newsletter RAG API",
     description="뉴스레터 기반 RAG 시스템 API",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan
 )
 
@@ -54,20 +59,34 @@ app.add_middleware(
 
 # ============ Request/Response Models ============
 
+class Message(BaseModel):
+    role: str
+    content: str
+
+
 class ChatRequest(BaseModel):
     query: str
+    history: list[Message] = []
 
 
-class QueryAnalysisInfo(BaseModel):
-    original_query: str
-    needs_retrieval: bool
-    rewritten_query: str
+class SubQueryInfo(BaseModel):
+    query: str
     hypothetical_document: str | None = None
     multi_queries: list[str] = []
     date_from: str | None = None
     date_to: str | None = None
     sender_filter: str | None = None
+    purpose: str = ""
+
+
+class QueryAnalysisInfo(BaseModel):
+    original_query: str
+    needs_retrieval: bool
+    query_type: str = "simple"
+    rewritten_query: str
+    sub_queries: list[SubQueryInfo] = []
     keywords: list[str] = []
+    aggregation_instruction: str | None = None
     chunks_found: int = 0
 
 
@@ -89,6 +108,17 @@ class HealthResponse(BaseModel):
     chroma: bool
     gmail: bool
     scheduler: dict[str, Any]
+
+
+# ============ Helpers ============
+
+def _trim_history(history: list[Message], max_pairs: int = 5) -> list[dict]:
+    """최근 N쌍(user+assistant)만 유지, dict 변환"""
+    messages = [{"role": m.role, "content": m.content} for m in history]
+    limit = max_pairs * 2
+    if len(messages) > limit:
+        messages = messages[-limit:]
+    return messages
 
 
 # ============ Endpoints ============
@@ -115,9 +145,10 @@ async def chat(request: ChatRequest):
     """
     RAG 채팅 엔드포인트
 
-    1. 쿼리로 유사 청크 검색
-    2. OpenAI Chat Completions API로 답변 생성
-    3. 파싱된 답변 + 인용 정보 반환
+    1. 대화 히스토리 정리
+    2. 쿼리 분석 (의도 분류 + 쿼리 분해 + 대화 맥락 해석)
+    3. 분기: 직접 답변 / 단순 검색 / 복합 검색
+    4. 답변 생성 + 인용 파싱
     """
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
@@ -125,41 +156,76 @@ async def chat(request: ChatRequest):
     logger.info(f"Chat request: {request.query[:50]}...")
 
     try:
-        # 1. 쿼리 분석 (routing + HyDE + multi-query)
-        analysis = analyze_query(request.query)
-        logger.info(f"Query analysis: needs_retrieval={analysis.needs_retrieval}")
+        # 0. 대화 히스토리 정리 (최근 5쌍)
+        history = _trim_history(request.history, max_pairs=5)
+
+        # 1. 쿼리 분석 (대화 맥락 포함)
+        analysis = analyze_query(request.query, conversation_history=history)
+        logger.info(
+            f"Query analysis: type={analysis.query_type}, "
+            f"sub_queries={len(analysis.sub_queries)}, "
+            f"needs_retrieval={analysis.needs_retrieval}"
+        )
 
         if not analysis.needs_retrieval:
             # 검색 불필요 → 직접 답변
-            result = generate_direct_answer(request.query)
-            chunks = []
-        else:
-            # 검색 필요 → HyDE + Multi-Query 검색
-            chunks = await search_similar_chunks(
-                query=analysis.rewritten_query,
-                hypothetical_doc=analysis.hypothetical_document,
-                multi_queries=analysis.multi_queries,
-                top_k=10,
-                date_from=analysis.date_from,
-                date_to=analysis.date_to,
-                sender=analysis.sender_filter,
+            result = await asyncio.to_thread(
+                generate_direct_answer, request.query, conversation_history=history
             )
-            # 원본 질문으로 답변 생성
-            result = generate_answer(request.query, chunks)
+            chunks = []
+
+        elif len(analysis.sub_queries) == 1:
+            # 단순 쿼리 → 기존 파이프라인
+            sq = analysis.sub_queries[0]
+            chunks = await search_similar_chunks(
+                query=sq.query,
+                hypothetical_doc=sq.hypothetical_document,
+                multi_queries=sq.multi_queries,
+                date_from=sq.date_from,
+                date_to=sq.date_to,
+                sender=sq.sender_filter,
+            )
+            result = await asyncio.to_thread(
+                generate_answer, request.query, chunks, conversation_history=history
+            )
+
+        else:
+            # 복합 쿼리 → 병렬 서브쿼리 검색 + 구조화 답변
+            merged, per_subquery = await search_with_sub_queries(analysis.sub_queries)
+            chunks = merged
+            result = await asyncio.to_thread(
+                generate_structured_answer,
+                request.query,
+                per_subquery,
+                analysis.aggregation_instruction,
+                history,
+            )
 
         # 응답 파싱
         parsed = parse_citations_response(result["content"], result["sources"])
 
+        # 서브쿼리 정보 구성
+        sub_query_infos = [
+            SubQueryInfo(
+                query=sq.query,
+                hypothetical_document=sq.hypothetical_document,
+                multi_queries=sq.multi_queries,
+                date_from=str(sq.date_from) if sq.date_from else None,
+                date_to=str(sq.date_to) if sq.date_to else None,
+                sender_filter=sq.sender_filter,
+                purpose=sq.purpose,
+            )
+            for sq in analysis.sub_queries
+        ]
+
         analysis_info = QueryAnalysisInfo(
             original_query=request.query,
             needs_retrieval=analysis.needs_retrieval,
+            query_type=analysis.query_type,
             rewritten_query=analysis.rewritten_query,
-            hypothetical_document=analysis.hypothetical_document,
-            multi_queries=analysis.multi_queries,
-            date_from=str(analysis.date_from) if analysis.date_from else None,
-            date_to=str(analysis.date_to) if analysis.date_to else None,
-            sender_filter=analysis.sender_filter,
+            sub_queries=sub_query_infos,
             keywords=analysis.keywords,
+            aggregation_instruction=analysis.aggregation_instruction,
             chunks_found=len(chunks),
         )
 
@@ -312,6 +378,6 @@ async def get_stats():
 async def root():
     return {
         "name": "Newsletter RAG API",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "docs": "/docs"
     }

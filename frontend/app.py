@@ -5,6 +5,7 @@ import os
 # Backend URL 설정
 BACKEND_URL = os.getenv("BACKEND_URL", "http://backend:8000")
 REQUEST_TIMEOUT = 60.0
+MAX_HISTORY_MESSAGES = 10  # 최근 5쌍(user+assistant)
 
 # 페이지 설정
 st.set_page_config(
@@ -41,6 +42,18 @@ def call_api(method: str, endpoint: str, **kwargs) -> dict | None:
     except Exception as e:
         st.error(f"연결 오류: {str(e)}")
         return None
+
+
+def build_chat_history() -> list[dict]:
+    """세션의 최근 메시지를 API 전송용 history로 변환"""
+    history = []
+    recent = st.session_state.messages[-MAX_HISTORY_MESSAGES:]
+    for msg in recent:
+        history.append({
+            "role": msg["role"],
+            "content": msg["content"],
+        })
+    return history
 
 
 # ============ Sidebar ============
@@ -105,18 +118,32 @@ with st.sidebar:
 
 # ============ Helper: 쿼리 분석 파이프라인 표시 ============
 
+QUERY_TYPE_LABELS = {
+    "simple": "단순 검색",
+    "comparison": "비교 분석",
+    "aggregation": "요약/정리",
+    "temporal_comparison": "시간대 비교",
+    "multi_topic": "복합 주제",
+    "opinion": "논조/관점 분석",
+    "multi_hop": "연쇄 추론",
+}
+
+
 def render_analysis(a: dict, expanded: bool = False):
     """쿼리 분석 과정을 단계별 파이프라인으로 표시"""
     if not a:
         return
 
     needs_retrieval = a.get("needs_retrieval", True)
+    query_type = a.get("query_type", "simple")
+    sub_queries = a.get("sub_queries", [])
 
     with st.expander("🔍 쿼리 분석 파이프라인", expanded=expanded):
         # --- Step 1: Routing ---
         st.markdown("**Step 1. Routing**")
         if needs_retrieval:
-            st.success("검색 필요 → RAG 파이프라인 실행")
+            type_label = QUERY_TYPE_LABELS.get(query_type, query_type)
+            st.success(f"검색 필요 → RAG 파이프라인 실행 (유형: {type_label})")
         else:
             st.info("검색 불필요 → 직접 답변")
             return
@@ -138,43 +165,73 @@ def render_analysis(a: dict, expanded: bool = False):
 
         st.divider()
 
-        # --- Step 3: HyDE ---
-        st.markdown("**Step 3. HyDE (Hypothetical Document)**")
-        if a.get("hypothetical_document"):
-            st.markdown(f"> {a['hypothetical_document']}")
+        # --- Step 3: 분기 - 단순 vs 복합 ---
+        if len(sub_queries) > 1:
+            # 복합 쿼리: 서브쿼리 분해 표시
+            st.markdown(f"**Step 3. Query Decomposition ({len(sub_queries)}개 서브쿼리)**")
+            for i, sq in enumerate(sub_queries, 1):
+                st.markdown(f"**서브쿼리 {i}**: `{sq.get('query', '')}`")
+                st.caption(f"목적: {sq.get('purpose', '')}")
+
+                filter_parts = []
+                if sq.get("date_from") or sq.get("date_to"):
+                    filter_parts.append(
+                        f"날짜: {sq.get('date_from', '?')} ~ {sq.get('date_to', '?')}"
+                    )
+                if sq.get("sender_filter"):
+                    filter_parts.append(f"발신인: {sq['sender_filter']}")
+                if filter_parts:
+                    st.caption(f"필터: {' | '.join(filter_parts)}")
+
+                if sq.get("hypothetical_document"):
+                    st.caption(f"HyDE: {sq['hypothetical_document'][:80]}...")
+
+                if i < len(sub_queries):
+                    st.markdown("---")
+
         else:
-            st.caption("가상 문서 없음")
+            # 단순 쿼리: 기존 HyDE + Multi-Query 표시
+            sq = sub_queries[0] if sub_queries else {}
+
+            st.markdown("**Step 3. HyDE (Hypothetical Document)**")
+            if sq.get("hypothetical_document"):
+                st.markdown(f"> {sq['hypothetical_document']}")
+            else:
+                st.caption("가상 문서 없음")
+
+            st.divider()
+
+            st.markdown("**Step 4. Multi-Query Expansion**")
+            multi_queries = sq.get("multi_queries", [])
+            if multi_queries:
+                for i, mq in enumerate(multi_queries, 1):
+                    st.markdown(f"  {i}. `{mq}`")
+            else:
+                st.caption("다중 쿼리 없음")
+
+            # 필터 표시
+            filter_parts = []
+            if sq.get("date_from") or sq.get("date_to"):
+                filter_parts.append(
+                    f"날짜: {sq.get('date_from', '?')} ~ {sq.get('date_to', '?')}"
+                )
+            if sq.get("sender_filter"):
+                filter_parts.append(f"발신인: {sq['sender_filter']}")
+            if filter_parts:
+                st.divider()
+                st.caption("필터: " + " | ".join(filter_parts))
 
         st.divider()
 
-        # --- Step 4: Multi-Query ---
-        st.markdown("**Step 4. Multi-Query Expansion**")
-        if a.get("multi_queries"):
-            for i, mq in enumerate(a["multi_queries"], 1):
-                st.markdown(f"  {i}. `{mq}`")
-        else:
-            st.caption("다중 쿼리 없음")
-
-        st.divider()
-
-        # --- Step 5: Filters + Results ---
-        st.markdown("**Step 5. 검색 실행**")
-        filter_parts = []
-        if a.get("date_from") or a.get("date_to"):
-            filter_parts.append(f"날짜: {a.get('date_from', '?')} ~ {a.get('date_to', '?')}")
-        if a.get("sender_filter"):
-            filter_parts.append(f"발신인: {a['sender_filter']}")
-
-        if filter_parts:
-            st.caption("필터: " + " | ".join(filter_parts))
-        else:
-            st.caption("필터 없음 (전체 검색)")
-
+        # --- 결과 ---
         chunks_found = a.get("chunks_found", 0)
         if chunks_found > 0:
             st.success(f"검색 결과: {chunks_found}개 청크")
         else:
             st.warning("검색 결과: 0개 청크")
+
+        if a.get("aggregation_instruction"):
+            st.caption(f"종합 전략: {a['aggregation_instruction']}")
 
 
 # ============ Main Chat Interface ============
@@ -208,6 +265,9 @@ for message in st.session_state.messages:
 
 # 사용자 입력
 if prompt := st.chat_input("뉴스레터에 대해 질문하세요"):
+    # 현재 메시지 추가 전에 history 구성 (현재 질문 중복 방지)
+    chat_history = build_chat_history()
+
     # 사용자 메시지 추가
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
@@ -216,7 +276,11 @@ if prompt := st.chat_input("뉴스레터에 대해 질문하세요"):
     # Assistant 응답
     with st.chat_message("assistant"):
         with st.spinner("답변 생성 중..."):
-            response = call_api("POST", "/chat", json={"query": prompt})
+            # 대화 히스토리 포함하여 API 호출
+            response = call_api(
+                "POST", "/chat",
+                json={"query": prompt, "history": chat_history},
+            )
 
         if response:
             answer_text = response.get("text", "응답을 생성할 수 없습니다.")
