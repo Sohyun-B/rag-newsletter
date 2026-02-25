@@ -4,17 +4,37 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
 
-# 청킹 설정
-CHUNK_SIZE = 512
-CHUNK_OVERLAP = 50
+
+def estimate_token_count(text: str) -> int:
+    """
+    토큰 수 추정 (대략적인 계산)
+    영어: 약 4자당 1토큰
+    한글: 약 2자당 1토큰
+    """
+    korean_chars = len([c for c in text if ord("가") <= ord(c) <= ord("힣")])
+    total_chars = len(text)
+
+    if total_chars == 0:
+        return 0
+
+    korean_ratio = korean_chars / total_chars
+    chars_per_token = 4 * (1 - korean_ratio) + 2 * korean_ratio
+    return int(total_chars / chars_per_token)
+
+
+# 청킹 설정 (토큰 기준)
+CHUNK_SIZE = 400    # 토큰 (한글 ~800자, 영어 ~1600자)
+CHUNK_OVERLAP = 50  # 토큰
+
+# 단락 구분 우선순위: 빈 줄 → 줄바꿈 → 문장 → 어절
+# 전처리(preprocessor.py)에서 \n{3,}을 \n\n으로 정규화하므로 \n\n이 최상위
 SEPARATORS = ["\n\n", "\n", ". ", "? ", "! ", " "]
 
-# 텍스트 스플리터 인스턴스
 splitter = RecursiveCharacterTextSplitter(
     chunk_size=CHUNK_SIZE,
     chunk_overlap=CHUNK_OVERLAP,
     separators=SEPARATORS,
-    length_function=len,
+    length_function=estimate_token_count,
 )
 
 
@@ -33,14 +53,12 @@ def chunk_email(text: str, metadata: dict[str, Any]) -> list[dict[str, Any]]:
         logger.warning("Text too short to chunk")
         return []
 
-    # 텍스트 분할
     chunks = splitter.split_text(text)
 
     if not chunks:
         logger.warning("No chunks created from text")
         return []
 
-    # 청크에 메타데이터 첨부
     result = []
     for i, chunk_content in enumerate(chunks):
         chunk_data = {
@@ -57,27 +75,5 @@ def chunk_email(text: str, metadata: dict[str, Any]) -> list[dict[str, Any]]:
         }
         result.append(chunk_data)
 
-    logger.info(f"Created {len(result)} chunks from email")
+    logger.info(f"Created {len(result)} chunks from email (token-based, size={CHUNK_SIZE})")
     return result
-
-
-def estimate_token_count(text: str) -> int:
-    """
-    토큰 수 추정 (대략적인 계산)
-    영어: 약 4자당 1토큰
-    한글: 약 2자당 1토큰
-    """
-    # 한글 비율 계산
-    korean_chars = len([c for c in text if ord("가") <= ord(c) <= ord("힣")])
-    total_chars = len(text)
-
-    if total_chars == 0:
-        return 0
-
-    korean_ratio = korean_chars / total_chars
-
-    # 가중 평균 계산
-    # 영어 기준: 4자/토큰, 한글 기준: 2자/토큰
-    chars_per_token = 4 * (1 - korean_ratio) + 2 * korean_ratio
-
-    return int(total_chars / chars_per_token)

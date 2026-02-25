@@ -259,7 +259,7 @@ def parse_citations_response(
     for i, source in enumerate(sources, 1):
         citations.append({
             "index": i,
-            "cited_text": "",
+            "cited_text": source.get("content", ""),
             "document_index": i - 1,
             "source": {
                 "subject": source.get("subject", "Unknown"),

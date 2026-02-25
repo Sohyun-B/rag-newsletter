@@ -11,6 +11,38 @@ from .query_analyzer import SubQuery
 logger = logging.getLogger(__name__)
 
 
+def _deduplicate_by_email(
+    chunks: list[dict],
+    max_chunks_per_email: int = 2,
+) -> list[dict]:
+    """
+    동일 email_id의 청크를 합쳐 하나의 citation으로 만든다.
+
+    - 같은 뉴스레터에서 top max_chunks_per_email개 청크의 내용을 이어붙임
+    - 점수(score)는 최고 점수 유지
+    - 결과는 score 내림차순 정렬
+    """
+    grouped: dict[int, list[dict]] = {}
+    for chunk in chunks:
+        eid = chunk.get("email_id")
+        if eid not in grouped:
+            grouped[eid] = []
+        grouped[eid].append(chunk)
+
+    merged = []
+    for email_chunks in grouped.values():
+        top = email_chunks[:max_chunks_per_email]
+        if len(top) == 1:
+            merged.append(top[0])
+        else:
+            combined = dict(top[0])  # 최고 점수 청크의 메타데이터 사용
+            combined["content"] = "\n\n".join(c["content"] for c in top)
+            merged.append(combined)
+
+    merged.sort(key=lambda x: x["score"], reverse=True)
+    return merged
+
+
 async def search_similar_chunks(
     query: str,
     hypothetical_doc: str | None = None,
@@ -107,11 +139,16 @@ async def search_similar_chunks(
     # 7. 점수 임계값으로 필터링
     filtered_chunks = [c for c in chunks if c["score"] >= score_threshold]
 
-    # 8. 점수 기준 정렬 (높은 순) + top_k 제한
+    # 8. 점수 기준 정렬
     filtered_chunks.sort(key=lambda x: x["score"], reverse=True)
+
+    # 9. 동일 뉴스레터 청크 머지 (같은 email_id → 하나의 citation으로)
+    filtered_chunks = _deduplicate_by_email(filtered_chunks)
+
+    # 10. top_k 제한
     filtered_chunks = filtered_chunks[:top_k]
 
-    logger.info(f"Returning {len(filtered_chunks)} chunks after filtering")
+    logger.info(f"Returning {len(filtered_chunks)} chunks (after dedup by email)")
     return filtered_chunks
 
 

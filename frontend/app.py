@@ -33,6 +33,9 @@ def call_api(method: str, endpoint: str, **kwargs) -> dict | None:
 
             if response.status_code == 200:
                 return response.json()
+            elif response.status_code == 409:
+                st.warning(response.json().get("detail", "이미 실행 중입니다."))
+                return None
             else:
                 st.error(f"API Error: {response.status_code} - {response.text}")
                 return None
@@ -260,7 +263,9 @@ for message in st.session_state.messages:
                         f"- 날짜: {source.get('received_at', '')}"
                     )
                     if cite.get("cited_text"):
-                        st.caption(f'"{cite["cited_text"][:100]}..."')
+                        text = cite["cited_text"]
+                        preview = text[:250] + ("..." if len(text) > 250 else "")
+                        st.markdown(f"> {preview}")
                     st.divider()
 
 # 사용자 입력
@@ -304,7 +309,9 @@ if prompt := st.chat_input("뉴스레터에 대해 질문하세요"):
                             f"- 날짜: {source.get('received_at', '')}"
                         )
                         if cite.get("cited_text"):
-                            st.caption(f'"{cite["cited_text"][:100]}..."')
+                            text = cite["cited_text"]
+                            preview = text[:250] + ("..." if len(text) > 250 else "")
+                            st.markdown(f"> {preview}")
                         st.divider()
 
             # 메시지 저장

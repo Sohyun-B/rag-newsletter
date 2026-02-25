@@ -19,6 +19,9 @@ from rag import (
 )
 from scheduler import start_scheduler, stop_scheduler, get_scheduler_status
 
+# 동기화 중복 실행 방지 락
+_sync_lock = asyncio.Lock()
+
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
@@ -256,50 +259,56 @@ async def sync_by_senders(request: SyncBySendersRequest):
     """발신인 기준으로 과거 이메일 수집 + ETL"""
     logger.info(f"Sync by senders: {request.senders}")
 
-    try:
-        inserted = fetch_emails_by_senders(request.senders, request.max_per_sender)
+    if _sync_lock.locked():
+        raise HTTPException(status_code=409, detail="동기화가 이미 실행 중입니다. 잠시 후 다시 시도해주세요.")
 
-        etl_result = await process_unprocessed_emails()
+    async with _sync_lock:
+        try:
+            inserted = await asyncio.to_thread(
+                fetch_emails_by_senders, request.senders, request.max_per_sender
+            )
+            etl_result = await process_unprocessed_emails()
 
-        return {
-            "inserted_count": len(inserted),
-            "inserted_emails": [
-                {"id": e["id"], "subject": e["subject"], "from": e["from_address"]}
-                for e in inserted
-            ],
-            "etl_result": etl_result
-        }
+            return {
+                "inserted_count": len(inserted),
+                "inserted_emails": [
+                    {"id": e["id"], "subject": e["subject"], "from": e["from_address"]}
+                    for e in inserted
+                ],
+                "etl_result": etl_result
+            }
 
-    except Exception as e:
-        logger.error(f"Sync by senders error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            logger.error(f"Sync by senders error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/sync")
 async def manual_sync():
-    """
-    수동 Gmail 동기화 + ETL 실행 (설정된 발신인 기준)
-    """
+    """수동 Gmail 동기화 + ETL 실행 (설정된 발신인 기준)"""
     logger.info(f"Manual sync triggered (senders: {settings.SYNC_SENDERS})")
 
-    try:
-        # 발신인 기반 Gmail 동기화
-        inserted = fetch_emails_by_senders(settings.SYNC_SENDERS)
+    if _sync_lock.locked():
+        raise HTTPException(status_code=409, detail="동기화가 이미 실행 중입니다. 잠시 후 다시 시도해주세요.")
 
-        # ETL 처리
-        etl_result = await process_unprocessed_emails()
+    async with _sync_lock:
+        try:
+            inserted = await asyncio.to_thread(
+                fetch_emails_by_senders, settings.SYNC_SENDERS
+            )
+            etl_result = await process_unprocessed_emails()
 
-        return {
-            "gmail_result": {
-                "inserted_count": len(inserted),
-                "senders": settings.SYNC_SENDERS,
-            },
-            "etl_result": etl_result,
-        }
+            return {
+                "gmail_result": {
+                    "inserted_count": len(inserted),
+                    "senders": settings.SYNC_SENDERS,
+                },
+                "etl_result": etl_result,
+            }
 
-    except Exception as e:
-        logger.error(f"Sync error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        except Exception as e:
+            logger.error(f"Sync error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/newsletters")
